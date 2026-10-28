@@ -2,6 +2,8 @@
 
 MoonEP 通过动态冗余专家均衡 MoE 的 token 负载，并融合跨卡通信与 token 重排。本适配在 Ascend 910C（A3）上使用 AscendC MTE 内核、CANN shmem 普通对称堆和主机侧规划器，支持 dispatch、combine、专家权重 prefetch 和梯度 reduce。
 
+适配设计、关键修复与本轮 benchmark 见 [适配过程与性能验证](docs/moonep_910C_adaption.md)。
+
 ## 支持范围
 
 历史验证环境为单机 8 × Ascend910_9392、CANN 9.1.0、Python 3.12；已有 PyTorch / torch_npu 2.9.1 和 2.12.0 的运行记录。PyTorch 或 torch_npu 版本变化后必须重新编译 `_C` 扩展。
@@ -69,7 +71,7 @@ python test_npu/mte/test_dispatch_combine_joint.py --R 8 --S 16 --K 4 --H 128
 torchrun --standalone --nproc_per_node=2 test_npu/mte/example_a3_buffer_usage.py
 ```
 
-前三项检查应输出 `ALL RANKS PASS`，示例应输出 `EXAMPLE PASS`。示例检查调用链、形状和有限值；数值正确性由前面的测试检查。2026-10-28 已使用指定节点列表复测；覆盖范围、失败尝试及原始证据见 [验证报告](docs/moonep_910c_validation_20261028.md)。
+前三项检查应输出 `ALL RANKS PASS`，示例应输出 `EXAMPLE PASS`。示例检查调用链、形状和有限值；数值正确性由前面的测试检查。2026-10-28 已完成复测；覆盖范围、失败尝试及证据说明见 [适配与验证文档](docs/moonep_910C_adaption.md)。
 
 示例展示完整调用顺序：初始化 HCCL、设置本地 NPU、构造 `Buffer(..., B=E//R, use_udma=False)`、初始化 `ShmemRuntime`、生成主机 plan、dispatch、combine，最后同步设备、调用 `ShmemRuntime.finalize()`，再销毁 Buffer 和进程组。路由变化时必须重建 plan。复用 plan 调用 dispatch 返回的 `cu_seqlens` 可能为 `None`，需保留规划阶段的值。
 
