@@ -54,6 +54,7 @@ import torch.distributed as dist
 import torch_npu
 
 from _bench_common import (
+    check_all_ranks,
     PROD_E,
     PROD_H,
     PROD_K,
@@ -130,6 +131,21 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
     # allocate_planning_outputs / torch.empty in the timed path.
     plan, cu_seqlens = allocate_planning_outputs(ctx)
     topk_flat = topk.reshape(-1).contiguous()
+    if args.plan_source == "golden":
+        from test_npu.planing_reference import reference_plan_and_cu_seqlens
+
+        # Preserve the complete canonical plan, including dedup tables. The
+        # builder must not rebuild these tables from an already encoded dst.
+        plan, cu_seqlens = reference_plan_and_cu_seqlens(ctx, topk, tpe)
+
+        def plan_step():
+            """Host-side plan: nothing to launch before dispatch."""
+            return None
+    else:
+        def plan_step():
+            """Time the device planner (also the per-iteration plan refresh)."""
+            return launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
+
     output_sh = torch.empty(S, H, dtype=torch.bfloat16, device=dev)
     output_sk = torch.empty(S, K, dtype=torch.float32, device=dev)
 
@@ -144,19 +160,32 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
 
     results = {}
     try:
-        if "planning" in flows:
+        # Validate the exact selected shape/routing before collecting latency.
+        plan_step()
+        launch_dispatch(ctx, hidden_sh, route_weights_sk, plan, build_dedup_map=args.plan_source != "golden")
+        torch.npu.synchronize()
+        dist.barrier(group=group)
+        launch_combine(ctx, output_sh, plan, output_sk=output_sk)
+        def check_payload():
+            torch.testing.assert_close(output_sh.cpu(), (hidden_sh.cpu().float() * K).to(torch.bfloat16),
+                                       rtol=0.02, atol=0.125)
+            torch.testing.assert_close(output_sk.cpu(), route_weights_sk.cpu(), rtol=0, atol=0)
+        check_all_ranks(check_payload, group)
+        if group_rank == 0:
+            print("roundtrip hidden + route weights PASS", flush=True)
+        if "planning" in flows and args.plan_source != "golden":
             results['planning'] = measure_flow(
                 "planning", "PlanningOp",
-                lambda: launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan),
+                plan_step,
                 group, group_rank, allow_stub=args.allow_stub,
                 warmup=args.warmup, iters=args.iters, cudagraph=args.cudagraph)
 
         if "dispatch_fwd" in flows:
             results['dispatch_fwd'] = measure_flow(
                 "dispatch_fwd", "PlanningOp",
-                lambda: (launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan),
+                lambda: (plan_step(),
                          launch_dispatch(ctx, hidden_sh, route_weights_sk, plan,
-                                         build_dedup_map=True)),
+                                         build_dedup_map=args.plan_source != "golden")),
                 group, group_rank, allow_stub=args.allow_stub,
                 warmup=args.warmup, iters=args.iters, cudagraph=args.cudagraph)
 
@@ -168,11 +197,16 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
                 group, group_rank, allow_stub=args.allow_stub,
                 warmup=args.warmup, iters=args.iters, cudagraph=args.cudagraph)
 
+        def restore_combine_input():
+            launch_dispatch(ctx, grad_output, route_weights_sk, plan,
+                            build_dedup_map=False)
+
         if "combine_fwd" in flows:
             results['combine_fwd'] = measure_flow(
                 "combine_fwd", "CombineOp",
                 lambda: launch_combine(ctx, output_sh, plan, output_sk=None),
                 group, group_rank, allow_stub=args.allow_stub,
+                prepare=restore_combine_input,
                 warmup=args.warmup, iters=args.iters, cudagraph=args.cudagraph)
 
         if "combine_bwd" in flows:
@@ -180,6 +214,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
                 "combine_bwd", "CombineOp",
                 lambda: launch_combine(ctx, output_sh, plan, output_sk=output_sk),
                 group, group_rank, allow_stub=args.allow_stub,
+                prepare=restore_combine_input,
                 warmup=args.warmup, iters=args.iters, cudagraph=args.cudagraph)
 
         # Bandwidth accounting (payload bytes / time for the timed dispatch/combine ops).
@@ -221,6 +256,11 @@ def parse_args():
                     help="Override total expert count E.")
     ap.add_argument("--flows", type=str, default=",".join(FLOWS),
                     help="Comma-separated flows to run: " + ",".join(FLOWS))
+    ap.add_argument(
+        "--plan-source", choices=("kernel", "golden"), default="kernel",
+        help="kernel: time the device planner (Ascend950); golden: build the "
+             "plan on the host with test_npu/planing_reference (required on "
+             "A2/A3, where the SIMT planner is not built).")
     ap.add_argument("--prod", action="store_true",
                     help="Run only the production 8-card config: "
                          "S=4096, K=16, E=896, H=7168, unbalance_ratio=1.0.")

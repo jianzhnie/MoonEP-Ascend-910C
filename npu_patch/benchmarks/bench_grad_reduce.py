@@ -3,7 +3,7 @@ MoonEP-Ascend remote expert weight-grad reduce benchmark.
 
 Ascend port of ``MoonEP/benchmarks/bench_grad_reduce.py``, driven through the
 low-level ``launch_grad_reduce`` exactly like ``test/test_grad_reduce.py``.
-On Ascend each rank owns a local ``[E, H, H']`` fp32 home-grad chunk and a
+On Ascend each rank owns a local ``[epn, H, H']`` fp32 home-grad chunk and a
 ``[B, H, H']`` fp32 reduce-slot chunk (symmetric memory); duplicated experts'
 grads flow back to their home ranks and the consumed slots are cleared.
 
@@ -27,6 +27,7 @@ import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
+    check_all_ranks,
     add_common_args,
     apply_engine,
     setup,
@@ -36,6 +37,9 @@ from _bench_common import (
 from npu_patch._device import local_device_index
 from npu_patch.buffer_c import (
     create_vmm_physical,
+    ensure_shmem_heap,
+    heap_mode,
+    _chunk_nbytes,
     reset_symmetric_descriptors,
     sym_tensor,
 )
@@ -126,11 +130,14 @@ def bench_case(case, args, rank, group, R, local_rank):
     assert all(0 <= c < R for c in counts), \
         f"{case['label']}: each count must be in [0, R)"
 
+    if heap_mode():
+        ensure_shmem_heap(_chunk_nbytes([epn, H, Hp], torch.float32) +
+                          _chunk_nbytes([B, H, Hp], torch.float32), group=group)
     plan = grad_reduce_plan(R, B, epn, counts, dev)
     # Buffer-backed only: allocate/register VMM chunks; after init_with_buffer
     # they become the local symmetric tensors the kernel expects (symmetric base).
     expert_grads_src, _, _ = create_vmm_physical(
-        [E, H, Hp], torch.float32, local_rank)
+        [epn, H, Hp], torch.float32, local_rank)
     reduce_buffers_src, _, _ = create_vmm_physical(
         [B, H, Hp], torch.float32, local_rank)
     expert_grads_src.zero_()
@@ -147,13 +154,33 @@ def bench_case(case, args, rank, group, R, local_rank):
     reduce_buffers = sym_tensor(reduce_buffers_src)
 
     try:
+        # All contributors target rank 0; check local epn ownership and slot clearing.
+        expert_grads.zero_()
+        reduce_buffers.fill_(1)
+        torch.npu.synchronize()
+        dist.barrier(group=group)
+        launch_grad_reduce(expert_grads, reduce_buffers, plan, rank=rank,
+                           num_sms=num_sms, meta_buf=None, meta_stride=0,
+                           barrier_off=0, grid_sync_bar=None)
+        torch.npu.synchronize()
+        def check_payload():
+            for expert, count in enumerate(counts):
+                expected = count if rank == 0 else 0
+                assert bool((expert_grads[expert] == expected).all().item()), (case['label'], expert)
+            for slot, expert in enumerate(plan[rank].cpu().tolist()):
+                expected = 0 if expert >= 0 else 1
+                assert bool((reduce_buffers[slot] == expected).all().item()), (case['label'], slot)
+        check_all_ranks(check_payload, group)
+        if rank == 0:
+            print(f"{case['label']}: nonzero gradients + consumed slots PASS", flush=True)
         res = time_kernel(
             lambda: launch_grad_reduce(
                 expert_grads, reduce_buffers, plan,
                 rank=rank, num_sms=num_sms,
                 meta_buf=None, meta_stride=0, barrier_off=0, grid_sync_bar=None),
             group, rank, warmup=args.warmup, iters=args.iters, agg="max",
-            cudagraph=args.cudagraph)
+            cudagraph=args.cudagraph,
+            prepare=lambda: (expert_grads.zero_(), reduce_buffers.fill_(1)))
     finally:
         # Re-init per case: finalize (tear down symmetric mappings) first, then
         # reverse the VMM allocations, then clear the descriptor registry.

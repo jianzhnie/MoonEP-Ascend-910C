@@ -34,6 +34,9 @@ from npu_patch._device import local_device_index
 from npu_patch import ShmemRuntime
 from npu_patch.buffer_c import (
     create_vmm_physical,
+    ensure_shmem_heap,
+    heap_mode,
+    _chunk_nbytes,
     reset_symmetric_descriptors,
     sym_tensor,
 )
@@ -342,6 +345,9 @@ def run_case(rank, local_rank, R, case, use_udma):
         #     via aclshmem RMA, so it must be a symmetric base, not an unregistered plain local tensor.
         # Keep alloc/init inside try: if init fails (e.g. the shmem 40 GiB heap limit, -2) the finally
         # block still finalizes/destroys/resets, so registered descriptors do not leak into the next case.
+        if heap_mode():
+            ensure_shmem_heap(_chunk_nbytes([epn, H, Hp], torch.float32) +
+                              _chunk_nbytes([B, H, Hp], torch.float32), group=None)
         expert_grads_src, _, _ = create_vmm_physical(
             (epn, H, Hp), torch.float32, local_device_index(local_rank))
         reduce_buffers_src, _, _ = create_vmm_physical(
@@ -415,6 +421,9 @@ def test_buffer_grad_reduce_repeated_launch(dist_env):
     try:
         # buffer-backed only: VMM chunk alloc + registration -> init_with_buffer -> sym_tensor translation.
         # The operator wants the local epn home grads ([epn,H,Hp]) plus the local B slots ([B,H,Hp]).
+        if heap_mode():
+            ensure_shmem_heap(_chunk_nbytes([epn, H, Hp], torch.float32) +
+                              _chunk_nbytes([B, H, Hp], torch.float32), group=None)
         expert_grads_src, _, _ = create_vmm_physical(
             (epn, H, Hp), torch.float32, local_device_index(local_rank))
         reduce_buffers_src, _, _ = create_vmm_physical(

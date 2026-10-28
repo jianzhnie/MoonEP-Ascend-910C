@@ -34,6 +34,8 @@ from ._common import (
     compute_shmem_mem_size,
 )
 from .buffer_c import (
+    heap_mode,
+    ensure_shmem_heap,
     shmem_finalize,
     shmem_init_with_ip_port,
     shmem_init_with_buffer,
@@ -162,7 +164,17 @@ class ShmemRuntime:
                 "reinitialization is forbidden")
         if enable_udma is None:
             enable_udma = _env_udma_enabled()
-        if cls._initialized:
+        if cls._initialized and not heap_mode():
+            return
+        if heap_mode():
+            # HEAP mode: ensure_shmem_heap() created the ordinary heap before
+            # the first chunk, so there is no descriptor-backed init to run.
+            # Validate that Buffer (or an explicit caller) created this scope.
+            from .buffer_c import _HEAP_STATE
+            if not _HEAP_STATE["inited"]:
+                raise RuntimeError("construct Buffer or explicitly initialize the shmem heap first")
+            ensure_shmem_heap(0, group=group)
+            cls._initialized = True
             return
         if enable_udma and not qp_count:
             qp_count = 2

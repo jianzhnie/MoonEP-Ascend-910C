@@ -4,7 +4,9 @@
 
 #include "acl/acl.h"
 #include "kernel_operator.h"
-#include "shmem.h"
+// Must come before any other shmem include: shmem_barrier.h adapts shmem's
+// intra-device core sync for A2/A3 (see its header comment).
+#include "ascend_moonep/kernels/shmem_barrier.h"
 
 #include "ascend_moonep/kernels/launch.h"
 
@@ -350,11 +352,14 @@ void MoonEPShmemGradReduceFused(
     // Every AIV on every rank must reach this collective. Do not add an AIV
     // early return above it, including for empty plans or blocks with no work.
     aclshmem_quiet();
-    // This kernel is [[core_ratio(0, 1)]] and launches AIV workers only.
-    // The installed CANN-SHMEM generic barrier also includes non-vector
-    // participants and deadlocks for this launch shape; use its vector-only
-    // device collective so the participant set matches the kernel grid.
-    aclshmemx_barrier_all_vec();
+    // Ascend950: this kernel is [[core_ratio(0, 1)]] and launches AIV workers
+    // only, and the installed CANN-SHMEM generic barrier also includes
+    // non-vector participants and deadlocks for this launch shape -- so
+    // MOONEP_SHMEM_BARRIER_ALL() selects the vector-only device collective
+    // there. On A2/A3 it resolves to the generic aclshmem_barrier_all() with
+    // the portable soft core sync instead (see shmem_barrier.h), which is the
+    // working combination on those SoCs.
+    MOONEP_SHMEM_BARRIER_ALL();
 
     ClearLocalSlots(
         reduce,

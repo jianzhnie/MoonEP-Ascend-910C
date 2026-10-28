@@ -40,6 +40,8 @@ from npu_patch._device import local_device_index
 from npu_patch import ShmemRuntime, _C
 from npu_patch.buffer_c import (
     create_vmm_physical,
+    heap_mode,
+    ensure_shmem_heap,
     reset_symmetric_descriptors,
     sym_tensor,
 )
@@ -181,6 +183,9 @@ def run_rank(local_rank: int, args) -> None:
                 init_method=f"tcp://{args.master_addr}:{args.master_port}",
                 rank=rank, world_size=world,
             )
+
+        if heap_mode():
+            ensure_shmem_heap(64 * 1024 * 1024, group=None)
 
         # Symmetric shards: register the VMM chunk -> init_with_buffer -> sym_tensor translation.
         hidden_src, _, _ = create_vmm_physical([n, h], torch.bfloat16, device_id)

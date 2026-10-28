@@ -424,6 +424,27 @@ void acl_vmm_set_access(int64_t va, int64_t size, int64_t device_id) {
         static_cast<uint32_t>(device_id), ACL_MEM_LOCATION_TYPE_DEVICE};
     const aclError rc = aclrtMemSetAccess(
         reinterpret_cast<void*>(va), static_cast<size_t>(size), &desc, 1);
+    // aclrtMemSetAccess only *widens* access to other devices: after
+    // aclrtMapMem the mapping device can already read and write the VA (a
+    // tensor built on the VA round-trips correctly). Some SoCs -- Ascend910_93
+    // observed here -- do not implement the API at all and return
+    // ACL_ERROR_RT_FEATURE_NOT_SUPPORT for every memAttr/flags combination, so
+    // treat exactly that code as a soft failure to keep the legacy (non-950)
+    // path usable. Any other error stays fatal.
+    if (rc == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                         "[moonep] aclrtMemSetAccess(va=%lld, size=%lld, "
+                         "device=%lld) unsupported on this SoC (rc=%d); "
+                         "continuing, local access is granted by aclrtMapMem.\n",
+                         static_cast<long long>(va), static_cast<long long>(size),
+                         static_cast<long long>(device_id),
+                         static_cast<int>(rc));
+            warned = true;
+        }
+        return;
+    }
     TORCH_CHECK(rc == ACL_SUCCESS,
                 "aclrtMemSetAccess(va=", va, ", size=", size,
                 ") failed with ", rc);
@@ -431,12 +452,24 @@ void acl_vmm_set_access(int64_t va, int64_t size, int64_t device_id) {
 
 int64_t acl_vmm_export_shareable(int64_t handle) {
     uint64_t shareable = 0;
+    // A physical handle can be exported only once, so the flag has to be
+    // correct on the *first* call. ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION
+    // is the Ascend950 behaviour; other SoCs reject it (Ascend910_93 returns
+    // ACL_ERROR_RT_FEATURE_NOT_SUPPORT) and the handle is already consumed, so
+    // a retry fails with ACL_ERROR_RT_DRV_INTERNAL_ERROR (507899). Pick the flag
+    // from the SoC name, mirroring the fabric branch in acl_vmm_alloc_source.
+    const char* soc = aclrtGetSocName();
+    const bool fabric_soc = soc != nullptr &&
+        std::string(soc).find("950") != std::string::npos;
+    const uint64_t flags = fabric_soc
+        ? ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION
+        : ACL_RT_VMM_EXPORT_FLAG_DEFAULT;
     const aclError rc = aclrtMemExportToShareableHandle(
         reinterpret_cast<aclrtDrvMemHandle>(handle),
-        ACL_MEM_HANDLE_TYPE_NONE,
-        ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareable);
+        ACL_MEM_HANDLE_TYPE_NONE, flags, &shareable);
     TORCH_CHECK(rc == ACL_SUCCESS,
-                "aclrtMemExportToShareableHandle failed with ", rc);
+                "aclrtMemExportToShareableHandle(flags=", flags,
+                ") failed with ", rc);
     return static_cast<int64_t>(shareable);
 }
 
@@ -565,6 +598,25 @@ int64_t acl_shmem_get_buffer_ptr(int64_t local_va) {
         return 0;
     }
     return reinterpret_cast<int64_t>(sym);
+}
+
+int64_t acl_shmem_heap_alloc(int64_t alignment, int64_t nbytes) {
+    // Allocate from shmem's *ordinary* heap through its own allocator.
+    //
+    // Carving the heap manually (bump allocator from aclshmemx_get_heap_base)
+    // is not safe: shmem allocates its internal pools from the very same heap
+    // at init/team-creation time (e.g. shmem_team.cpp takes SYNC_POOL_SIZE via
+    // aclshmem_malloc), so a private allocator starting at the heap base
+    // silently overlaps them. On Ascend910_93 that showed up as a handful of
+    // corrupted elements in the receive buffer, because the device barrier
+    // keeps writing into its sync pool. Going through aclshmem_align() keeps
+    // every consumer on one allocator.
+    void* ptr = aclshmem_align(static_cast<size_t>(alignment),
+                               static_cast<size_t>(nbytes));
+    TORCH_CHECK(ptr != nullptr,
+                "aclshmem_align(alignment=", alignment, ", size=", nbytes,
+                ") failed");
+    return reinterpret_cast<int64_t>(ptr);
 }
 
 // Shared buffer-backed init. Both bootstraps (UID single-node / ip_port

@@ -34,6 +34,9 @@ from npu_patch import ShmemRuntime, launch_prefetch
 from npu_patch.buffer_c import (
     create_sym_tensor_from_ptr,
     create_vmm_physical,
+    ensure_shmem_heap,
+    heap_mode,
+    _chunk_nbytes,
     map_to_sym_ptr,
     reset_symmetric_descriptors,
 )
@@ -198,6 +201,8 @@ def make_symmetric_experts(R, E, H, Hp, B, device_id):
     the buffer-backed descriptor set. Returns the ``keepalive`` tensor (
     ``data_ptr()`` = source VA); ``device_id`` is the local NPU device id (LOCAL_RANK)."""
     epn = (E + R - 1) // R
+    if heap_mode():
+        ensure_shmem_heap(_chunk_nbytes([epn + B, H, Hp], torch.bfloat16), group=None)
     return create_vmm_physical([epn + B, H, Hp], torch.bfloat16, device_id)[0]
 
 

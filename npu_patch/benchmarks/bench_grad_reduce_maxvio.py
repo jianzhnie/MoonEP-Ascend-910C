@@ -63,39 +63,10 @@ from npu_patch.planning import allocate_planning_outputs
 
 def time_op(fn, group, rank, warmup=20, iters=50, cudagraph=True):
     """Time a kernel and print per-rank latency."""
-    dev = torch.device(f"npu:{torch.npu.current_device()}")
-    ws = dist.get_world_size(group=group)
-
-    # Warmup
-    for _ in range(warmup):
-        fn()
-    torch.npu.synchronize()
-    dist.barrier(group=group)
-
-    # Measure
-    start = torch.npu.Event(enable_timing=True)
-    end = torch.npu.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    end.synchronize()
-    local_us = start.elapsed_time(end) / iters * 1e3
-
-    # Gather per-rank times
-    t = torch.tensor([local_us], dtype=torch.float64, device=dev)
-    outs = [torch.empty(1, dtype=torch.float64, device=dev) for _ in range(ws)]
-    dist.all_gather(outs, t, group=group)
-    cat = torch.cat(outs)
-    times = [o.item() for o in outs]
-
-    if rank == 0:
-        print(f"  [time_op] per-rank: {[f'{t:.1f}' for t in times]} "
-              f"max={max(times):.1f} mean={sum(times)/len(times):.1f} us",
-              flush=True)
-
-    dist.barrier(group=group)
-    return cat.mean().item()
+    from _bench_common import time_kernel
+    return time_kernel(fn, group, rank, warmup=warmup, iters=iters,
+                       agg="mean", cudagraph=cudagraph,
+                       prepare=fn.__self__.prepare_grad_input)["us"]
 
 
 def gbps(bytes_transferred, us):
@@ -145,8 +116,11 @@ class GradReduceRunner:
     NAME = 'moonep'
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, hp=2048,
-                 use_udma=False):
+                 use_udma=False, plan_source='kernel'):
         self.group = group
+        # 'kernel': device planner (Ascend950/SIMT only); 'golden': host plan via
+        # test_npu/planing_reference -- the only way to run on A2/A3.
+        self.plan_source = plan_source
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
         self.R = R
@@ -189,13 +163,22 @@ class GradReduceRunner:
     def prepare(self, topk, tpe):
         """Materialize the plan (experts_to_copy) for grad_reduce."""
         self._topk_flat = topk.reshape(-1).contiguous()
-        launch_planning(self.ctx, self._topk_flat, tpe, self.cu_seqlens,
-                        self.plan)
+        if self.plan_source == 'golden':
+            from test_npu.planing_reference import reference_plan_and_cu_seqlens
+            self.plan, self.cu_seqlens = reference_plan_and_cu_seqlens(
+                self.ctx, self._topk_flat, tpe)
+        else:
+            launch_planning(self.ctx, self._topk_flat, tpe, self.cu_seqlens,
+                            self.plan)
         # Byte accounting from the plan's slot table (global expert ids).
         etc_cpu = self.plan.experts_to_copy.cpu()   # [R, B] int32, -1 = idle
         self.max_recv = int((etc_cpu >= 0).sum(dim=1).max().item())
         torch.npu.synchronize()
         ShmemRuntime.barrier(group=self.group)
+
+    def prepare_grad_input(self):
+        self.expert_grads.zero_()
+        self.reduce_buffers.fill_(1)
 
     def grad_reduce(self):
         """Run grad_reduce for 1 projection."""
@@ -234,6 +217,11 @@ def main():
                     help='Comma-separated target MaxVio values; the lognormal '
                          'sigma is reverse-solved for each (default: %(default)s)')
     ap.add_argument('--experts', type=int, default=384)
+    ap.add_argument('--plan-source', choices=('kernel', 'golden'),
+                    default='kernel',
+                    help='kernel: device planner (Ascend950/SIMT only); golden: '
+                         'build the plan on the host with '
+                         'test_npu/planing_reference (required on A2/A3).')
     ap.add_argument('--hidden', type=int, default=7168)
     ap.add_argument('--topk', type=int, default=8)
     ap.add_argument('--hp', type=int, default=2048,
@@ -273,7 +261,8 @@ def main():
     multi_node = world_size > local_world_size
 
     runner = GradReduceRunner(group, R, S, K, E, H, args.num_sms, local_rank,
-                              hp=args.hp, use_udma=use_udma)
+                              hp=args.hp, use_udma=use_udma,
+                              plan_source=args.plan_source)
     if not ShmemRuntime.is_initialized():
         if args.ip_port is not None or multi_node:
             # Multi-node: ip_port/DEFAULT bootstrap. When ip_port is omitted it

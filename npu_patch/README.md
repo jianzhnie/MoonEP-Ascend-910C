@@ -1,3 +1,5 @@
+> Ascend 910C（A3）构建与使用见 [MoonEP + 910C](../README_910C.md)。下文的 950 构建步骤不适用于 910C。
+
 # npu_patch（MoonEP Ascend NPU 后端）
 
 `npu_patch` 是 MoonEP 仓库内为 **Ascend（NPU）** 提供的后端模块，由

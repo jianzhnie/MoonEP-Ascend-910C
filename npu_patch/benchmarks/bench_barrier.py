@@ -39,6 +39,9 @@ from npu_patch import ShmemRuntime
 from npu_patch._C import launch_device_barrier_bench
 from npu_patch.buffer_c import (
     create_vmm_physical,
+    ensure_shmem_heap,
+    heap_mode,
+    _chunk_nbytes,
     reset_symmetric_descriptors,
 )
 from npu_patch.shmem_runtime import default_shmem_ip_port
@@ -64,7 +67,7 @@ def parse_args():
 
 def gather_rank_times(local_us: float, world_size: int):
     device = torch.device(f"npu:{torch.npu.current_device()}")
-    value = torch.tensor([local_us], dtype=torch.float64, device=device)
+    value = torch.tensor([local_us], dtype=torch.float32, device=device)
     gathered = [torch.empty_like(value) for _ in range(world_size)]
     dist.all_gather(gathered, value)
     return [float(item.item()) for item in gathered]
@@ -90,6 +93,8 @@ def main():
     # Buffer-backed SHMEM requires at least one identically sized registered
     # descriptor on every rank. The benchmark kernel itself does not touch it;
     # SHMEM owns and uses its internal synchronization pool.
+    if heap_mode():
+        ensure_shmem_heap(_chunk_nbytes([4096], torch.uint8), group=None)
     backing, _, _ = create_vmm_physical(
         [4096], torch.uint8,
         torch.npu.current_device())

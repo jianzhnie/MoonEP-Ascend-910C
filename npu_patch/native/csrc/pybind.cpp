@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 
 #include "acl_shared_buffer.h"
+#include "host_planning.h"
 #include "launcher.h"
 #include "shmem.h"
 
@@ -17,6 +18,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           arg("iterations"), arg("block_dim") = 32,
           "Launch a device kernel containing only repeated "
           "aclshmemx_barrier_all_vec calls");
+
+    // A2/A3 host planner: the device planner is SIMT-only, so non-SIMT
+    // targets build a C++ implementation of the same plan contract.
+    m.def("plan_host",
+          [](const torch::Tensor& counts_all,
+             const torch::Tensor& local_counts,
+             const torch::Tensor& route_ids,
+             int64_t rank,
+             int64_t epn,
+             int64_t nvs) {
+              auto result = BuildHostPlan(
+                  counts_all, local_counts, route_ids, rank, epn, nvs);
+              py::dict out;
+              out["dst"] = result.dst;
+              out["cu_seqlens"] = result.cu_seqlens;
+              out["experts_to_copy"] = result.experts_to_copy;
+              out["remote_stats"] = result.remote_stats;
+              out["zero_fill_ranges"] = result.zero_fill_ranges;
+              out["alloc"] = result.alloc;
+              out["needed_remote"] = result.needed_remote;
+              out["local_span"] = py::make_tuple(result.span_begin, result.span_end);
+              return out;
+          },
+          arg("counts_all"), arg("local_counts"), arg("route_ids"),
+          arg("rank"), arg("epn"), arg("nvs"),
+          "Build a MoonEP plan on the host (A2/A3 non-SIMT path)");
 
     // shmem init/finalize (new; absent in the CUDA build).
     m.def("acl_shmem_init", &ascend_moonep::acl_shmem_init,
@@ -118,6 +145,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("acl_shmem_get_heap_base", &ascend_moonep::acl_shmem_get_heap_base,
           arg("mem_type"),
           "Return the shmem symmetric heap base for a memory type (0=host, 1=device)");
+    m.def("acl_shmem_heap_alloc", &ascend_moonep::acl_shmem_heap_alloc,
+          arg("alignment"), arg("nbytes"),
+          "Allocate (aligned) memory from shmem's ordinary symmetric heap");
     m.def("acl_shmem_get_buffer_ptr", &ascend_moonep::acl_shmem_get_buffer_ptr,
           arg("local_va"),
           "Translate a registered local VA to its local symmetric address (0 if unregistered)");

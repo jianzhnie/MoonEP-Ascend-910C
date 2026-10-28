@@ -14,7 +14,9 @@
 
 #include "kernel_operator.h"
 #include "ascend_moonep/kernels/types.h"
-#include "shmem.h"
+// shmem_barrier.h pulls in shmem.h and must come first: it adapts shmem's
+// intra-device core sync for A2/A3 (see its header comment).
+#include "ascend_moonep/kernels/shmem_barrier.h"
 
 using namespace AscendC;
 
@@ -635,7 +637,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
 
     // Completes the scatter RMA updates and synchronizes all vector cores on
     // every rank before the local duplicate expansion reads the receive buffer.
-    aclshmemx_barrier_all_vec();
+    MOONEP_SHMEM_BARRIER_ALL();
 
     __gm__ bf16_t* hbuf = reinterpret_cast<__gm__ bf16_t*>(hidden_buf_gm);
 

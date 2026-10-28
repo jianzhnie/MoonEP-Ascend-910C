@@ -27,6 +27,7 @@ import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
+    check_all_ranks,
     add_common_args,
     apply_engine,
     setup,
@@ -37,6 +38,9 @@ from npu_patch import ShmemRuntime, launch_prefetch
 from npu_patch.buffer_c import (
     create_sym_tensor_from_ptr,
     create_vmm_physical,
+    ensure_shmem_heap,
+    heap_mode,
+    _chunk_nbytes,
     map_to_sym_ptr,
     reset_symmetric_descriptors,
 )
@@ -141,6 +145,8 @@ def bench_case(case, args, rank, group, R):
     assert all(0 <= c < R for c in counts), \
         f"{case['label']}: each count must be in [0, R)"
 
+    if heap_mode():
+        ensure_shmem_heap(_chunk_nbytes([epn + B, H, Hp], torch.bfloat16), group=group)
     keepalive = make_symmetric_experts(rank, R, E, H, Hp, B)
     local_expert = keepalive[:epn]
     prefetch_src = keepalive[epn:]
@@ -165,6 +171,20 @@ def bench_case(case, args, rank, group, R):
         sym_base + epn * row_bytes, [B, H, Hp], torch.bfloat16, dev)
 
     try:
+        # Nonzero untimed payload check; unused slots must retain the sentinel.
+        local_expert.fill_(rank + 1)
+        prefetch_buffers.fill_(-123)
+        torch.npu.synchronize()
+        dist.barrier(group=group)
+        launch_prefetch(remote_expert, prefetch_buffers, experts_to_copy, num_sms=num_sms)
+        torch.npu.synchronize()
+        def check_payload():
+            for slot, expert in enumerate(experts_to_copy.cpu().tolist()):
+                expected = -123 if expert < 0 else expert // epn + 1
+                assert bool((prefetch_buffers[slot] == expected).all().item()), (case['label'], slot)
+        check_all_ranks(check_payload, group)
+        if rank == 0:
+            print(f"{case['label']}: nonzero payload PASS", flush=True)
         res = time_kernel(
             lambda: launch_prefetch(
                 remote_expert, prefetch_buffers, experts_to_copy, num_sms=num_sms),

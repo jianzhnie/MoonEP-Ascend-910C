@@ -91,6 +91,7 @@ void acl_vmm_free_source(int64_t va, int64_t handle);
 // ================================================================
 // mem_type: 0=HOST_SIDE, 1=DEVICE_SIDE (default DEVICE_SIDE).
 int64_t acl_shmem_get_heap_base(int64_t mem_type);
+int64_t acl_shmem_heap_alloc(int64_t alignment, int64_t nbytes);
 // Translate a local VA registered in the buffer-backed symmetric space to its
 // local symmetric address; 0 = unregistered.
 int64_t acl_shmem_get_buffer_ptr(int64_t local_va);

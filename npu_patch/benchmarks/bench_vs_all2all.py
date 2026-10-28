@@ -88,6 +88,14 @@ all2all baseline owns no expert weights, so its ``pf`` is 0 by construction):
   - pf:   ``launch_prefetch`` timed separately (its share of d_f/d_b) | 0
 Bandwidth = S*K*H*2 / t (logical payload bytes, same formula for both libs); ``pf``
 is reported separately and is NOT part of the payload bandwidth.
+
+``--plan-source golden`` (needed on A2/A3, where the SIMT planner is not built):
+the MoonEP arm takes its plan from the host reference
+(``test_npu/planing_reference.py``, rebuilt in the untimed ``prepare`` for every
+routing), so the ``plan`` column is n/a and d_f is dispatch (with the plan's
+dedup tables) + prefetch. On A3 also pick a small ``--hp``: the per-rank
+``[epn + B, H, hp]`` expert-weight chunks must fit the symmetric heap (the
+ordinary-heap mode caps out well below the A5 VMM path).
 ``d_f``/``d_b``/``c_f``/``c_b`` are the ops on the MoE critical path; the epilogue
 arithmetic of the baseline is bf16 (the op under test is the communication).
 
@@ -130,6 +138,7 @@ import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
+    check_all_ranks,
     add_engine_args,
     apply_engine,
     setup,
@@ -173,7 +182,17 @@ def make_symmetric_experts(device_id, R, E, H, Hp, B):
 
 def time_op(fn, group, rank, warmup=20, iters=50, cudagraph=False):
     return time_kernel(fn, group, rank, warmup=warmup, iters=iters,
-                       agg="mean", cudagraph=cudagraph)["us"]
+                       agg="mean", cudagraph=cudagraph,
+                       prepare=(getattr(fn.__self__, "prepare_combine", None)
+                                if getattr(fn, "__name__", "").startswith("combine") else None))["us"]
+
+
+def time_op_stats(fn, group, rank, warmup=20, iters=50, cudagraph=False):
+    """Per-iteration event timing: ``{us, p50, p90}`` (see time_kernel)."""
+    return time_kernel(fn, group, rank, warmup=warmup, iters=iters,
+                       agg="mean", cudagraph=cudagraph, percentiles=True,
+                       prepare=(getattr(fn.__self__, "prepare_combine", None)
+                                if getattr(fn, "__name__", "").startswith("combine") else None))
 
 
 def gbps(S, K, H, us):
@@ -221,7 +240,7 @@ class MoonEPRunner:
     NAME = 'moonep'
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank,
-                 use_udma=False, hp=3072):
+                 use_udma=False, hp=3072, plan_source='kernel'):
         self.group = group
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
@@ -229,6 +248,12 @@ class MoonEPRunner:
         self.local_rank = local_rank
         self.use_udma = use_udma
         self.hp = hp
+        # 'kernel': time the device planner (Ascend950/SIMT).
+        # 'golden': build the plan on the host with the torch reference
+        # (test_npu/planing_reference.py) -- the SIMT planner is not built for
+        # dav-c220, so this is the only way to run the MoonEP arm on A2/A3.
+        self.plan_source = plan_source
+        self._planning_unavailable = plan_source == 'golden'
         self.buffer = Buffer(S, H, K, E, R, num_sms=num_sms, group=group,
                              use_udma=use_udma, explicitly_destroy=True)
         self.ctx = self.buffer._require_ctx()
@@ -287,11 +312,18 @@ class MoonEPRunner:
         self.topk, self.tpe = topk, tpe
         self._topk_flat = topk.reshape(-1).contiguous()
         # Untimed full dispatch (low-level): materializes the plan + dedup
-        # structures used by the saved-plan dispatch/combine below.
-        launch_planning(self.ctx, self._topk_flat, tpe, self.cu_seqlens,
-                        self.plan)
+        # structures used by the saved-plan dispatch/combine below. In golden
+        # mode the plan comes from the host reference instead of the planning
+        # kernel, so the routing-dependent plan is rebuilt here (untimed).
+        if self.plan_source == 'golden':
+            from test_npu.planing_reference import reference_plan_and_cu_seqlens
+            self.plan, self.cu_seqlens = reference_plan_and_cu_seqlens(
+                self.ctx, self._topk_flat, tpe)
+        else:
+            launch_planning(self.ctx, self._topk_flat, tpe, self.cu_seqlens,
+                            self.plan)
         launch_dispatch(self.ctx, hidden, weights, self.plan,
-                        build_dedup_map=True)
+                        build_dedup_map=self.plan_source != 'golden')
         # Byte accounting for the prefetch reporting (plan slot table, global
         # expert ids) -- same as bench_vs.py.
         etc_cpu = self.plan.experts_to_copy.cpu()   # [R, B] int32, -1 = idle
@@ -321,10 +353,11 @@ class MoonEPRunner:
     def dispatch_fwd(self):
         # full fwd: planning + dispatch + epilogue, then prefetch (the forward
         # expert GEMMs consume the prefetched weights).
-        launch_planning(self.ctx, self._topk_flat, self.tpe,
-                        self.cu_seqlens, self.plan)
+        if self.plan_source != 'golden':
+            launch_planning(self.ctx, self._topk_flat, self.tpe,
+                            self.cu_seqlens, self.plan)
         launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
-                        build_dedup_map=True)
+                        build_dedup_map=self.plan_source != 'golden')
         self._prefetch()
 
     def dispatch_bwd(self):
@@ -333,6 +366,11 @@ class MoonEPRunner:
         launch_dispatch(self.ctx, self.hidden, None, self.plan,
                         build_dedup_map=False)
         self._prefetch()
+
+    def prepare_combine(self):
+        # Combine reduces duplicate rows in place: restore every receive row.
+        launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
+                        build_dedup_map=False)
 
     def combine_fwd(self):
         # c_f: hidden only
@@ -543,12 +581,9 @@ class All2AllRunner:
         # unpermute back to (token, k) order and reduce over the topk.
         y3 = torch.index_select(self.y_back, 0, self.inv_perm).view(
             self.S, self.K, self.H)
-        if with_weights:
-            w3 = torch.index_select(
-                self.w_back.view(-1), 0, self.inv_perm).to(torch.bfloat16)
-            self.out_sh.copy_(torch.sum(y3 * w3.view(self.S, self.K, 1), dim=1))
-        else:
-            self.out_sh.copy_(torch.sum(y3, dim=1))
+        # combine_bwd gathers route-weight gradients separately; it does not
+        # multiply hidden by routing weights (same contract as MoonEP c_b).
+        self.out_sh.copy_(torch.sum(y3, dim=1))
 
     def destroy(self):
         # No symmetric/shared memory and no plan: the buffers are ordinary NPU
@@ -619,6 +654,14 @@ def main():
                     help='Comma-separated target MaxVio values; the lognormal '
                          'sigma is reverse-solved for each (default: %(default)s)')
     ap.add_argument('--experts', type=int, default=1024)
+    ap.add_argument('--plan-source', choices=('kernel', 'golden'),
+                    default='kernel',
+                    help='MoonEP planning source: kernel = time the device '
+                         'planner (Ascend950/SIMT); golden = build the plan on '
+                         'the host with test_npu/planing_reference (required on '
+                         'A2/A3, where the SIMT planner is not built). The '
+                         'planning column is 0 for the all2all baseline either '
+                         'way (it has no plan) and n/a in golden mode.')
     ap.add_argument('--hidden', type=int, default=3584)
     ap.add_argument('--topk', type=int, default=16)
     ap.add_argument('--hp', type=int, default=3072,
@@ -629,6 +672,9 @@ def main():
                     help='MoonEP op SM budget (the all2all baseline has none).')
     ap.add_argument('--warmup', type=int, default=20)
     ap.add_argument('--iters', type=int, default=50)
+    ap.add_argument('--percentiles', action='store_true',
+                    help='add per-iteration p50/p90 timing (own methodology: '
+                         'per-iter event sync slightly inflates samples)')
     ap.add_argument('--ip-port', default=None,
                     help='shmem DEFAULT-bootstrap ip_port URL for the '
                          'buffer-backed shmem init ("tcp://<rank0_ip>:<port>" '
@@ -672,7 +718,8 @@ def main():
     if 'moonep' in args.libs:
         runners['moonep'] = MoonEPRunner(group, R, S, K, E, H, args.num_sms,
                                          local_rank, use_udma=use_udma,
-                                         hp=args.hp)
+                                         hp=args.hp,
+                                         plan_source=args.plan_source)
     if 'all2all' in args.libs:
         runners['all2all'] = All2AllRunner(group, R, S, K, E, H,
                                            args.num_sms, local_rank)
@@ -740,15 +787,42 @@ def main():
             for lib in args.libs:
                 runner = runners[lib]
                 runner.prepare(topk, tpe, hidden, weights)
-                d_f = time_op(runner.dispatch_fwd, group, rank, args.warmup,
-                              args.iters, cudagraph=cudagraph)
-                d_b = time_op(runner.dispatch_bwd, group, rank, args.warmup,
-                              args.iters, cudagraph=cudagraph)
-                c_f = time_op(runner.combine_fwd, group, rank, args.warmup,
-                              args.iters, cudagraph=cudagraph)
-                c_b = time_op(runner.combine_bwd, group, rank, args.warmup,
-                              args.iters, cudagraph=cudagraph)
-                if hasattr(runner, 'planning'):
+                torch.npu.synchronize()
+                dist.barrier(group=group)
+                # Untimed roundtrip check for each routing and implementation.
+                runner.combine_bwd()
+                def check_payload():
+                    actual = runner.output_sh if lib == 'moonep' else runner.out_sh
+                    expected = (hidden.cpu().float() * K).to(torch.bfloat16)
+                    torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.125)
+                    gathered = (runner.output_sk if lib == 'moonep' else
+                                runner.w_back.reshape(-1).index_select(0, runner.inv_perm).view(S, K))
+                    torch.testing.assert_close(gathered.cpu(), weights.cpu(), rtol=0, atol=0)
+                check_all_ranks(check_payload, group)
+                if rank == 0:
+                    print(f'{lib}: roundtrip hidden + route weights PASS', flush=True)
+                if args.percentiles:
+                    stats = {op: time_op_stats(getattr(runner, op), group, rank,
+                                                 args.warmup, args.iters,
+                                                 cudagraph=cudagraph)
+                             for op in ('dispatch_fwd', 'dispatch_bwd',
+                                        'combine_fwd', 'combine_bwd')}
+                    d_f = stats['dispatch_fwd']["us"]
+                    d_b = stats['dispatch_bwd']["us"]
+                    c_f = stats['combine_fwd']["us"]
+                    c_b = stats['combine_bwd']["us"]
+                else:
+                    stats = None
+                    d_f = time_op(runner.dispatch_fwd, group, rank, args.warmup,
+                                  args.iters, cudagraph=cudagraph)
+                    d_b = time_op(runner.dispatch_bwd, group, rank, args.warmup,
+                                  args.iters, cudagraph=cudagraph)
+                    c_f = time_op(runner.combine_fwd, group, rank, args.warmup,
+                                  args.iters, cudagraph=cudagraph)
+                    c_b = time_op(runner.combine_bwd, group, rank, args.warmup,
+                                  args.iters, cudagraph=cudagraph)
+                if hasattr(runner, 'planning') and not getattr(
+                        runner, '_planning_unavailable', False):
                     # MoonEP: planning is a real kernel and is measured exactly
                     # and separately (it is part of d_f, not of d_b).
                     plan_us = time_op(runner.planning, group, rank, args.warmup,
@@ -757,7 +831,8 @@ def main():
                     # all2all: no planning kernel at all -- the destination rank
                     # comes straight from expert // epn, and the grouping counts
                     # are exchanged once (untimed) in prepare().
-                    plan_us = 0.0
+                    # MoonEP in golden mode: same, the plan is host-computed.
+                    plan_us = float('nan') if getattr(runner, '_planning_unavailable', False) else 0.0
                 if hasattr(runner, 'prefetch'):
                     # MoonEP: prefetch is included in d_f/d_b (bench_vs.py's
                     # convention) and also measured on its own for its share.
@@ -777,6 +852,11 @@ def main():
                                  d_b_gbps=gbps(S, K, H, d_b),
                                  c_f_gbps=gbps(S, K, H, c_f),
                                  c_b_gbps=gbps(S, K, H, c_b)))
+                if stats is not None:
+                    for short, op in (('d_f', 'dispatch_fwd'), ('d_b', 'dispatch_bwd'),
+                                      ('c_f', 'combine_fwd'), ('c_b', 'combine_bwd')):
+                        rows[-1][f'{short}_p50_us'] = stats[op]['p50']
+                        rows[-1][f'{short}_p90_us'] = stats[op]['p90']
                 if rank == 0:
                     extra = ''
                     if lib == 'all2all':
@@ -787,14 +867,27 @@ def main():
                         pf_gbps = (3 * runner.max_recv * H * args.hp * 2
                                    / (pf_us * 1e-6) / 1e9)
                         extra = (f' | pf {pf_us:6.1f} us ({pf_gbps:4.0f} GB/s)')
+                    if getattr(runner, '_planning_unavailable', False):
+                        plan_txt = '   n/a (host golden plan)'
+                    else:
+                        plan_txt = (f'{plan_us:6.1f} us '
+                                    f'({plan_us / d_f * 100:4.1f}%)')
                     print(f'{lib:>8} ep={R} E={E} H={H} K={K} '
                           f'sigma={sigma:.5f}: maxvio={maxvio:6.2f} | '
-                          f'plan {plan_us:6.1f} us ({plan_us / d_f * 100:4.1f}%)'
+                          f'plan {plan_txt}'
                           f' | d_f {d_f:7.1f} us ({gbps(S, K, H, d_f):5.0f} '
                           f'GB/s) | d_b {d_b:7.1f} us ({gbps(S, K, H, d_b):5.0f}'
                           f' GB/s) | c_f {c_f:7.1f} us ({gbps(S, K, H, c_f):5.0f}'
                           f' GB/s) | c_b {c_b:7.1f} us ({gbps(S, K, H, c_b):5.0f}'
                           f' GB/s){extra}', flush=True)
+                    if stats is not None:
+                        print('           p50/p90 us: ' + ' | '.join(
+                            f'{short} {stats[op]["p50"]:7.1f}/{stats[op]["p90"]:7.1f}'
+                            for short, op in (('d_f', 'dispatch_fwd'),
+                                              ('d_b', 'dispatch_bwd'),
+                                              ('c_f', 'combine_fwd'),
+                                              ('c_b', 'combine_bwd'))),
+                            flush=True)
             if rank == 0 and 'moonep' in timings and 'all2all' in timings:
                 m, a = timings['moonep'], timings['all2all']
                 ratios = ' '.join(f'{op} x{a[op] / m[op]:.2f}'

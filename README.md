@@ -33,6 +33,8 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 
 ## Supported Devices
 
+- Ascend 910C (A3): [build, usage and limitations](README_910C.md)
+
 - NVIDIA GPU
 - Zhenwu PPU (under review, coming soon)
 

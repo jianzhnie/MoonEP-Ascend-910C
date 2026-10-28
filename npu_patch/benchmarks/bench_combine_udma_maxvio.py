@@ -351,9 +351,9 @@ def time_op(fn, group, rank, warmup=20, iters=50, verbose=True, stats=None):
 
     dev = torch.device(f"npu:{torch.npu.current_device()}")
     world_size = dist.get_world_size(group=group)
-    local = torch.tensor([local_us], dtype=torch.float64, device=dev)
+    local = torch.tensor([local_us], dtype=torch.float32, device=dev)
     gathered = [
-        torch.empty(1, dtype=torch.float64, device=dev)
+        torch.empty(1, dtype=torch.float32, device=dev)
         for _ in range(world_size)
     ]
     dist.all_gather(gathered, local, group=group)
@@ -616,8 +616,12 @@ class CombineUdmaRunner:
     """Own the Buffer, plan, symmetric inputs, and fixed combine outputs."""
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, with_weights,
-                 rank=None, stats=None):
+                 rank=None, stats=None, plan_source='kernel'):
         self.group = group
+        # 'kernel': device planner (Ascend950/SIMT only); 'golden': host plan via
+        # test_npu/planing_reference -- required on A2/A3. (The URMA engine
+        # itself stays A5-only: UBC_CTP/URMA channels do not exist on A3.)
+        self.plan_source = plan_source
         self.rank = rank if rank is not None else dist.get_rank(group=group)
         self.stats = stats
         self.R = R
@@ -670,13 +674,19 @@ class CombineUdmaRunner:
 
     def prepare(self, topk, tokens_per_expert):
         """Run base routing and the automatic combine execution-plan substage."""
-        launch_planning(
-            self.ctx,
-            topk.reshape(-1).contiguous(),
-            tokens_per_expert,
-            self.cu_seqlens,
-            self.plan,
-        )
+        topk_flat = topk.reshape(-1).contiguous()
+        if self.plan_source == 'golden':
+            from test_npu.planing_reference import reference_plan_and_cu_seqlens
+            self.plan, self.cu_seqlens = reference_plan_and_cu_seqlens(
+                self.ctx, topk_flat, tokens_per_expert)
+        else:
+            launch_planning(
+                self.ctx,
+                topk_flat,
+                tokens_per_expert,
+                self.cu_seqlens,
+                self.plan,
+            )
         torch.npu.synchronize()
         ShmemRuntime.barrier(group=self.group)
 
@@ -830,6 +840,12 @@ def main():
         help="sigma-based MaxVio sweep or cyclic correctness-test plan",
     )
     parser.add_argument("--tokens", type=int, default=8192)
+    parser.add_argument("--plan-source", choices=("kernel", "golden"),
+                        default="kernel",
+                        help="kernel: device planner (Ascend950/SIMT only); "
+                             "golden: host plan via test_npu/planing_reference "
+                             "(required on A2/A3). The URMA engine itself stays "
+                             "A5-only.")
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
@@ -877,6 +893,13 @@ def main():
         rank, world_size, local_rank = setup()
         group = dist.group.WORLD
     local_rank = local_device_index(local_rank)
+    from npu_patch.api import _is_ascend950
+    if not _is_ascend950(local_rank, torch.npu.get_device_properties(local_rank)):
+        if rank == 0:
+            print("SKIP: combine UDMA benchmark requires Ascend950; 910C uses MTE", flush=True)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return
     stats = None
     R = world_size
     S, K, E, H = args.tokens, args.topk, args.experts, args.hidden
@@ -901,6 +924,7 @@ def main():
         local_rank,
         with_weights=not args.no_weights,
         rank=rank if args.no_dist else None,
+        plan_source=args.plan_source,
     )
     qp_count = created_qp_count(args.active_qp_count)
     if not ShmemRuntime.is_initialized():

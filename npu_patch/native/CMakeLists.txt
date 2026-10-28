@@ -82,27 +82,43 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 include("${CMAKE_SOURCE_DIR}/cmake/AscendMoonEPKernel.cmake")
 
 # All device kernels and their host launch wrappers are linked into one library.
+# The *_udma sources need the SIMT toolchain and only exist for the Ascend950
+# (dav-c310) target: on the A2/A3 target (dav-c220) the runtime selects the MTE
+# kernels anyway (python: _is_ascend950 gates udma), so keep them out of that
+# build instead of failing on the missing simt_api headers.
+set(ASCEND_MOONEP_KERNEL_SOURCES
+    kernels/barrier_bench.cpp
+    kernels/moonep_combine.cpp
+    kernels/moonep_dispatch.cpp
+    kernels/moonep_grad_reduce.cpp
+    kernels/prefetch.cpp
+)
+set(ASCEND_MOONEP_KERNEL_DEFINITIONS CATLASS_ARCH=${ASCEND_MOONEP_CATLASS_ARCH})
+if(ASCEND_MOONEP_BISHENG_ARCH STREQUAL "a5")
+    list(APPEND ASCEND_MOONEP_KERNEL_SOURCES
+        kernels/planning.cpp
+        kernels/moonep_combine_udma.cpp
+        kernels/moonep_dispatch_udma.cpp
+        kernels/moonep_grad_reduce_udma.cpp
+        kernels/prefetch_udma.cpp
+    )
+    list(APPEND ASCEND_MOONEP_KERNEL_DEFINITIONS USE_SIMT)
+else()
+    # A2/A3: the planner and the UDMA variants are SIMT-only, so keep their
+    # entry points as stubs that fail loudly; the MTE kernels above are the ones
+    # that actually run there.
+    list(APPEND ASCEND_MOONEP_KERNEL_SOURCES kernels/non_simt_stubs.cpp)
+endif()
+
 ascend_moonep_add_kernel_library(
     ascend_moonep_kernels
-    SOURCES
-        kernels/barrier_bench.cpp
-        kernels/moonep_combine.cpp
-        kernels/moonep_combine_udma.cpp
-        kernels/moonep_dispatch.cpp
-        kernels/moonep_dispatch_udma.cpp
-        kernels/moonep_grad_reduce.cpp
-        kernels/moonep_grad_reduce_udma.cpp
-        kernels/planning.cpp
-        kernels/prefetch.cpp
-        kernels/prefetch_udma.cpp
+    SOURCES ${ASCEND_MOONEP_KERNEL_SOURCES}
     INCLUDES
         include
         kernels
         ../3rdparty/catlass/include
         ../3rdparty/catlass
-    COMPILE_DEFINITIONS
-        CATLASS_ARCH=${ASCEND_MOONEP_CATLASS_ARCH}
-        USE_SIMT
+    COMPILE_DEFINITIONS ${ASCEND_MOONEP_KERNEL_DEFINITIONS}
 )
 
 message(STATUS "ascend-moonep kernel library: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libascend_moonep_kernels.so")

@@ -30,9 +30,12 @@ from ._common import (
 from .buffer_c import (
     _OWNER_SOURCE_VA_ATTR,
     _SLOT_SOURCE_VA_ATTR,
+    _chunk_nbytes,
     create_sym_tensor_from_ptr,
     create_sym_tensor_from_source,
     create_vmm_physical,
+    ensure_shmem_heap,
+    heap_mode,
     map_to_sym_ptr,
 )
 from .planning import MoonEPCommPlan, allocate_planning_outputs
@@ -235,6 +238,28 @@ def _create_context(
         requested_udma.update({name: bool(value) for name, value in udma_flags.items()})
     effective_udma = {name: bool(udma_supported and ctx_udma_flags[name] and requested_udma[name])
                       for name in ctx_udma_flags}
+
+    if heap_mode():
+        # HEAP mode (A3): chunks are carved out of shmem's ordinary heap, which
+        # must exist before the first allocation. Size it from the exact chunk
+        # list below so nothing is over-reserved.
+        ws_bytes_needed = _op_ws_bytes_from_env()
+        heap_need = (
+            _chunk_nbytes([NvS, H], torch.bfloat16)
+            + _chunk_nbytes([NvS], torch.int32)
+            + _chunk_nbytes([BARRIER_SLOTS], torch.int32)
+            + _chunk_nbytes(
+                [R * _COMBINE_SYNC_BYTES_PER_RANK + _COMBINE_LOCAL_AIV_SYNC_BYTES],
+                torch.uint8)
+            + _chunk_nbytes([dispatch_sync_buffer_nbytes(R)], torch.uint8)
+            + int(planning_symmetric_bytes)
+            + 2 * int(ws_bytes_needed)
+        )
+        if effective_udma['combine']:
+            heap_need += _chunk_nbytes(
+                [combine_put_workspace_bytes(NvS, H, R)], torch.uint8)
+        ensure_shmem_heap(heap_need, device_id=device, group=group,
+                          rank=rank, world_size=R)
 
     hidden_buf, _, _ = create_vmm_physical([NvS, H], torch.bfloat16, device)
     # Cross-rank (symmetric) dispatch metadata.

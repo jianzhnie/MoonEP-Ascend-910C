@@ -39,6 +39,8 @@ from npu_patch._device import local_device_index
 from npu_patch import ShmemRuntime, _C
 from npu_patch.buffer_c import (
     create_vmm_physical,
+    heap_mode,
+    ensure_shmem_heap,
     reset_symmetric_descriptors,
     sym_tensor,
 )
@@ -115,6 +117,9 @@ def run_rank(local_rank: int, args) -> None:
                 rank=rank, world_size=args.R,
             )
 
+        if heap_mode():
+            ensure_shmem_heap(64 * 1024 * 1024, group=None)
+
         # Symmetric shards: register the VMM chunk -> init_with_buffer -> sym_tensor translation.
         hidden_src, _, _ = create_vmm_physical([n, h], torch.bfloat16, device_id)
         hidden_src.zero_()
@@ -143,7 +148,11 @@ def run_rank(local_rank: int, args) -> None:
         dst, dup_groups, dup_loffs, dup_counts, _expected = dispatch_test.make_plan(
             args, rank
         )
-        hidden = dispatch_test.make_hidden(rank, args)
+        if args.random_hidden:
+            generator = torch.Generator().manual_seed(args.seed + rank)
+            hidden = torch.randn(args.S, args.H, generator=generator).to(torch.bfloat16)
+        else:
+            hidden = dispatch_test.make_hidden(rank, args)
         hidden_npu = hidden.to(device=device)
         weights_npu = (
             dispatch_test.make_weights(rank, args).to(device=device)
@@ -276,6 +285,8 @@ def parse_args():
         ),
     )
     p.add_argument("--no-weights", action="store_true")
+    p.add_argument("--random-hidden", action="store_true",
+                   help="Use independent random columns to expose UB pipeline reuse races")
     p.add_argument(
         "--prod-shape",
         action="store_true",

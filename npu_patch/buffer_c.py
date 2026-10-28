@@ -19,6 +19,7 @@ Difference from the Python-package version: RAII -- the deleter runs
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -41,6 +42,10 @@ from ._C import (
     acl_vmm_free_source,
     # shmem buffer-heap (PR-653)
     acl_shmem_get_buffer_ptr,
+    acl_shmem_heap_alloc,
+    acl_shmem_get_heap_base,
+    acl_shmem_get_unique_id,
+    acl_shmem_init_uid,
     acl_shmem_init_with_buffers,
     acl_shmem_init_with_buffers_ip_port,
 )
@@ -98,6 +103,10 @@ def shmem_finalize() -> int:
     rc = int(acl_shmem_finalize())
     if rc == 0:
         _SHMEM_BACKING_LOCKED = False
+        # The heap itself is gone after a successful finalize; reset the
+        # bookkeeping so a later ensure_shmem_heap() rebuilds it instead of
+        # handing out addresses from a finalized runtime.
+        _HEAP_STATE.update(inited=False, base=0, offset=0, size=0, lazy=False, scope=None)
     return rc
 
 
@@ -123,6 +132,12 @@ def shmem_init_with_ip_port(my_pe: int, n_pes: int, ip_port: str,
     ``aclshmem_n_pes()`` (callers pass rank/world_size from dist).
     """
     global _SHMEM_BACKING_LOCKED
+    if heap_mode():
+        # ensure_shmem_heap() already created the ordinary heap before the first
+        # chunk; there are no descriptors to register. Pin the backing so the
+        # per-chunk destroy() stays a no-op until a collective finalize.
+        _SHMEM_BACKING_LOCKED = True
+        return
     if device_id is None:
         device_id = int(torch.npu.current_device())
     # Match the UID-backed path's ownership transaction: seal the registry
@@ -315,6 +330,152 @@ class VmmAllocation:
 _VMM_REGISTRY: list[VmmAllocation] = []
 
 
+# ---------------------------------------------------------------------------
+# HEAP mode: serve the symmetric chunks from shmem's *ordinary* heap.
+#
+# The buffer-backed path needs the framework-owned VMM chunks to be shareable
+# across processes. SoCs without fabric handles cannot import a peer's VMM
+# handle (cross-process import fails with 507899 on Ascend910_93), so
+# ``acl_shmemx_init_attr_with_buffers`` fails there. cann-shmem's ordinary heap
+# does work on those SoCs (see ``shmem/examples/init``), so this mode allocates
+# the chunks from that heap through shmem's own allocator (``aclshmem_align``)
+# -- their addresses are then already symmetric and ``acl_shmem_ptr``
+# translates them as usual.
+# Enable with ``ASCEND_MOONEP_HEAP=shmem``.
+# ---------------------------------------------------------------------------
+_HEAP_MODE_ENV = "ASCEND_MOONEP_HEAP"
+_HEAP_BYTES_ENV = "ASCEND_MOONEP_HEAP_BYTES"
+_HEAP_ALIGN = 2 * 1024 * 1024
+
+
+def heap_mode() -> bool:
+    """Whether chunks come from shmem's ordinary heap (``ASCEND_MOONEP_HEAP``)."""
+    return os.environ.get(_HEAP_MODE_ENV, "vmm").strip().lower() == "shmem"
+
+
+_HEAP_STATE = {"inited": False, "base": 0, "offset": 0, "size": 0,
+               "lazy": False, "scope": None}
+
+
+class HeapAllocation:
+    """Bookkeeping for one chunk carved out of the shmem ordinary heap.
+
+    Mirrors the parts of :class:`VmmAllocation` the callers touch; it owns no
+    physical handle and needs no per-chunk release (``aclshmem_finalize``
+    releases the whole heap).
+    """
+
+    def __init__(self, source_va, size, device_id: int) -> None:
+        self.source_va = int(source_va)
+        self.size = int(size)
+        self.device_id = int(device_id)
+        self.mem_handle = 0
+        self.shareable_handle = None
+        self.fabric_handle_bytes = b""
+        self._destroyed = False
+        self._registered = False
+
+    @property
+    def owned_handle(self):
+        """Descriptor alias; heap chunks own no physical handle."""
+        return 0
+
+    def destroy(self) -> None:
+        """No-op: the heap is released once, by ``aclshmem_finalize``."""
+        self._destroyed = True
+
+
+def ensure_shmem_heap(total_bytes: int, device_id=None, group=None,
+                      rank=None, world_size=None) -> None:
+    """Create the ordinary shmem heap once per process (collective, UID bootstrap).
+
+    ``total_bytes`` is the sum of every symmetric chunk the caller is about to
+    carve out; ``ASCEND_MOONEP_HEAP_BYTES`` overrides the computed size.
+    Repeated calls must use the same process group, device and PE scope.
+    Construct Buffer first, or call this explicitly before standalone allocations.
+    """
+    # pylint: disable=import-outside-toplevel
+    import torch.distributed as dist
+
+    if device_id is None:
+        device_id = int(torch.npu.current_device())
+    if rank is None:
+        rank = dist.get_rank(group=group) if dist.is_initialized() else 0
+    if world_size is None:
+        world_size = dist.get_world_size(group=group) if dist.is_initialized() else 1
+    effective_group = (dist.group.WORLD if group is None else group) if dist.is_initialized() else None
+    scope = (effective_group, int(device_id), int(rank), int(world_size))
+    if _HEAP_STATE["inited"]:
+        if _HEAP_STATE["scope"] != scope:
+            raise RuntimeError("shmem heap belongs to a different process group/device/rank scope")
+        return
+
+    override = os.environ.get(_HEAP_BYTES_ENV, "").strip()
+    if override:
+        size = int(override)
+    else:
+        size = int(total_bytes) + 256 * 1024 * 1024
+    size = ((size + _HEAP_ALIGN - 1) // _HEAP_ALIGN) * _HEAP_ALIGN
+
+    uid = acl_shmem_get_unique_id() if int(rank) == 0 else None
+    if int(world_size) > 1:
+        # ``src`` is a global rank even when ``group`` is an EP subgroup, and
+        # HCCL groups provide no CPU/object transport -- broadcast the UID as
+        # NPU tensors (same pattern as ShmemRuntime.init_with_buffer).
+        uid_root = 0 if group is None else dist.get_global_rank(group, 0)
+        device = torch.device("npu", int(device_id))
+        uid_length = torch.tensor(
+            [len(uid) if uid is not None else 0], dtype=torch.int64, device=device)
+        dist.broadcast(uid_length, src=uid_root, group=group)
+        length = int(uid_length.item())
+        if length <= 0:
+            raise RuntimeError("aclshmem UID broadcast produced an invalid byte length")
+        uid_tensor = (
+            torch.tensor(list(uid), dtype=torch.uint8, device=device)
+            if uid is not None
+            else torch.empty(length, dtype=torch.uint8, device=device))
+        dist.broadcast(uid_tensor, src=uid_root, group=group)
+        uid = bytes(uid_tensor.cpu().tolist())
+    rc = acl_shmem_init_uid(int(rank), int(world_size), size, bytes(uid),
+                            int(device_id))
+    if rc != 0:
+        raise RuntimeError(f"acl_shmem_init_uid(local_mem_size={size}) failed with {rc}")
+    base = int(acl_shmem_get_heap_base(1))
+    if base == 0:
+        raise RuntimeError("acl_shmem_get_heap_base(1) returned 0 after init")
+    _HEAP_STATE.update(inited=True, base=base, offset=0, size=size, lazy=False, scope=scope)
+
+
+def _heap_alloc(nbytes: int) -> int:
+    """Reserve ``nbytes`` of the shmem ordinary heap and return its address.
+
+    The memory comes from *shmem's own* allocator (``aclshmem_align``): shmem
+    allocates its internal pools (team sync pools, core sync counters, ...) from
+    the same heap while it initializes, so a private allocator started at the
+    heap base would overlap them and be corrupted by device-side barriers.
+    """
+    if not _HEAP_STATE["inited"]:
+        raise RuntimeError(
+            "ordinary shmem heap is not initialized; construct Buffer first or "
+            "call ensure_shmem_heap(total_bytes, group=ep_group) before allocation")
+    if int(torch.npu.current_device()) != _HEAP_STATE["scope"][1]:
+        raise RuntimeError("allocation device differs from the shmem heap device")
+    if _HEAP_STATE["offset"] + int(nbytes) > _HEAP_STATE["size"]:
+        raise RuntimeError(
+            f"shmem heap too small: {int(nbytes)} bytes requested, "
+            f"{_HEAP_STATE['size'] - _HEAP_STATE['offset']} of "
+            f"{_HEAP_STATE['size']} left; raise {_HEAP_BYTES_ENV}"
+            " (or leave it unset so the size follows the caller's chunk sum)")
+    va = int(acl_shmem_heap_alloc(_HEAP_ALIGN, int(nbytes)))
+    _HEAP_STATE["offset"] += int(nbytes)
+    return va
+
+
+def heap_footprint() -> int:
+    """Bytes handed out by this process (diagnostics)."""
+    return int(_HEAP_STATE["offset"])
+
+
 def register_symmetric_descriptor(allocation: VmmAllocation) -> None:
     """Register a VMM range for buffer-backed symmetric-space init."""
     if _SHMEM_BACKING_LOCKED:
@@ -334,6 +495,9 @@ def symmetric_descriptors():
     from addr); non-empty fabric_bytes is consumed directly by shmem (no
     re-export). Already ``destroy()``-ed allocations are skipped.
     """
+    if heap_mode():
+        # The heap owns the memory, so there is nothing to hand to shmem.
+        return ()
     return tuple(
         (a.source_va, a.size,
          int(a.mem_handle) if a.mem_handle else 0,
@@ -439,6 +603,19 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
     nbytes = _chunk_nbytes(shape, dtype)
     device_id = int(device)
     _require_current_device(device_id)
+    if heap_mode():
+        # Ordinary-heap chunk: the address is already symmetric, so no VMM
+        # handle, no descriptor registration and no shareable export.
+        va = _heap_alloc(nbytes)
+        allocation = HeapAllocation(va, nbytes, device_id)
+        try:
+            tensor = create_sym_tensor_from_ptr(
+                va, list(shape), dtype, torch.device(f"npu:{device_id}"))
+            tensor._vmm_allocation = allocation
+        except Exception:
+            allocation.destroy()
+            raise
+        return tensor, 0, 0
     # Alloc uses the visible index; set_access uses the physical card id
     # (see docstring).
     access_device_id = local_physical_id(device_id)
@@ -472,6 +649,10 @@ def map_to_sym_ptr(va, name: str) -> int:
     Requires an initialized buffer-backed symmetric heap
     (``shmem_init_with_buffer``) and a registered ``va``; raises otherwise.
     """
+    if heap_mode():
+        # Chunks already live in the symmetric heap, so the local address *is*
+        # the symmetric address; ``acl_shmem_ptr(va, pe)`` translates it.
+        return int(va)
     sym = int(acl_shmem_get_buffer_ptr(int(va)))
     if sym == 0:
         raise RuntimeError(

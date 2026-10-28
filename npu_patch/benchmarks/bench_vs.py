@@ -100,7 +100,9 @@ def make_symmetric_experts(device_id, R, E, H, Hp, B):
 
 def time_op(fn, group, rank, warmup=20, iters=50, cudagraph=True):
     return time_kernel(fn, group, rank, warmup=warmup, iters=iters,
-                       agg="mean", cudagraph=cudagraph)["us"]
+                       agg="mean", cudagraph=cudagraph,
+                       prepare=(getattr(fn.__self__, "prepare_combine", None)
+                                if getattr(fn, "__name__", "").startswith("combine") else None))["us"]
 
 
 def gbps(S, K, H, us):
@@ -149,7 +151,7 @@ class MoonEPRunner:
     NAME = 'moonep'
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, hp=2048,
-                 use_udma=False):
+                 use_udma=False, plan_source='kernel'):
         self.group = group
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
@@ -157,6 +159,12 @@ class MoonEPRunner:
         self.local_rank = local_rank
         self.hp = hp
         self.use_udma = use_udma
+        # 'kernel': time the device planner (Ascend950/SIMT only).
+        # 'golden': build the plan on the host with test_npu/planing_reference
+        # (required on A2/A3, where planning_kernel_do is not built) -- same
+        # switch bench_vs_all2all.py / bench_comm.py carry.
+        self.plan_source = plan_source
+        self._planning_unavailable = plan_source == 'golden'
         self.buffer = Buffer(S, H, K, E, R, num_sms=num_sms, group=group,
                              use_udma=use_udma, explicitly_destroy=True)
         self.ctx = self.buffer._require_ctx()
@@ -216,10 +224,15 @@ class MoonEPRunner:
         self._topk_flat = topk.reshape(-1).contiguous()
         # Untimed full dispatch (low-level): materializes the plan + dedup
         # structures used by saved-plan dispatch/combine below.
-        launch_planning(self.ctx, self._topk_flat, tpe, self.cu_seqlens,
-                        self.plan)
+        if self.plan_source == 'golden':
+            from test_npu.planing_reference import reference_plan_and_cu_seqlens
+            self.plan, self.cu_seqlens = reference_plan_and_cu_seqlens(
+                self.ctx, self._topk_flat, tpe)
+        else:
+            launch_planning(self.ctx, self._topk_flat, tpe, self.cu_seqlens,
+                            self.plan)
         launch_dispatch(self.ctx, hidden, weights, self.plan,
-                        build_dedup_map=True)
+                        build_dedup_map=self.plan_source != 'golden')
         # Byte accounting from the plan's slot table (global expert ids).
         etc_cpu = self.plan.experts_to_copy.cpu()   # [R, B] int32, -1 = idle
         self.max_recv = int((etc_cpu >= 0).sum(dim=1).max().item())
@@ -229,6 +242,8 @@ class MoonEPRunner:
         ShmemRuntime.barrier(group=self.group)
 
     def planning(self):
+        if self.plan_source == 'golden':
+            return  # host-computed plan: the device planner does not run
         launch_planning(self.ctx, self._topk_flat, self.tpe,
                         self.cu_seqlens, self.plan)
 
@@ -250,10 +265,11 @@ class MoonEPRunner:
 
     def dispatch_fwd(self):
         # full fwd (low-level): planning + dispatch + epilogue, then prefetch.
-        launch_planning(self.ctx, self._topk_flat, self.tpe,
-                        self.cu_seqlens, self.plan)
+        if self.plan_source != 'golden':
+            launch_planning(self.ctx, self._topk_flat, self.tpe,
+                            self.cu_seqlens, self.plan)
         launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
-                        build_dedup_map=True)
+                        build_dedup_map=self.plan_source != 'golden')
         self._prefetch()
 
     def dispatch_bwd(self):
@@ -262,6 +278,11 @@ class MoonEPRunner:
         launch_dispatch(self.ctx, self.hidden, None, self.plan,
                         build_dedup_map=False)
         self._prefetch()
+
+    def prepare_combine(self):
+        # Combine reduces duplicate rows in place: restore every receive row.
+        launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
+                        build_dedup_map=False)
 
     def combine_fwd(self):
         # c_f: hidden only
@@ -299,6 +320,12 @@ def main():
     ap.add_argument('--maxvios', default='0.2,1,10,20',
                     help='Comma-separated target MaxVio values; the lognormal '
                          'sigma is reverse-solved for each (default: %(default)s)')
+    ap.add_argument('--plan-source', choices=('kernel', 'golden'),
+                    default='kernel',
+                    help='kernel: time the device planner (Ascend950/SIMT); '
+                         'golden: build the plan on the host with '
+                         'test_npu/planing_reference (required on A2/A3, where '
+                         'the SIMT planner is not built) and report plan as n/a.')
     ap.add_argument('--experts', type=int, default=1024)
     ap.add_argument('--hidden', type=int, default=3584)
     ap.add_argument('--topk', type=int, default=16)
@@ -344,7 +371,8 @@ def main():
     # descriptors registered) -> init (single-node UID bootstrap / multi-node
     # ip_port bootstrap) -> _prepare_shmem_views maps symmetric tensors.
     runner = MoonEPRunner(group, R, S, K, E, H, args.num_sms, local_rank,
-                          hp=args.hp, use_udma=use_udma)
+                          hp=args.hp, use_udma=use_udma,
+                          plan_source=args.plan_source)
     if not ShmemRuntime.is_initialized():
         if args.ip_port is not None or multi_node:
             # Multi-node: ip_port/DEFAULT bootstrap; when ip_port is omitted it
@@ -393,8 +421,11 @@ def main():
                           args.iters, cudagraph=args.cudagraph)
             c_b = time_op(runner.combine_bwd, group, rank, args.warmup,
                           args.iters, cudagraph=args.cudagraph)
-            plan_us = time_op(runner.planning, group, rank, args.warmup,
-                              args.iters, cudagraph=args.cudagraph)
+            if args.plan_source == 'golden':
+                plan_us = float('nan')   # host-computed plan: nothing to time
+            else:
+                plan_us = time_op(runner.planning, group, rank, args.warmup,
+                                  args.iters, cudagraph=args.cudagraph)
             pf = time_op(runner.prefetch, group, rank, args.warmup, args.iters,
                          cudagraph=args.cudagraph)
             pf_gbps = (3 * runner.max_recv * H * runner.hp * 2
@@ -408,9 +439,12 @@ def main():
                              c_f_gbps=gbps(S, K, H, c_f),
                              c_b_gbps=gbps(S, K, H, c_b)))
             if rank == 0:
+                plan_txt = ('n/a (host golden plan)'
+                            if args.plan_source == 'golden'
+                            else f'{plan_us:6.1f} us ({plan_us / d_f * 100:4.1f}%)')
                 print(f'{"moonep":>8} ep={R} E={E} H={H} K={K} sigma={sigma:.5f}: '
                       f'maxvio={maxvio:6.2f} | '
-                      f'plan {plan_us:6.1f} us ({plan_us / d_f * 100:4.1f}%) | '
+                      f'plan {plan_txt} | '
                       f'd_f {d_f:7.1f} us ({gbps(S, K, H, d_f):5.0f} GB/s) | '
                       f'd_b {d_b:7.1f} us ({gbps(S, K, H, d_b):5.0f} GB/s) | '
                       f'c_f {c_f:7.1f} us ({gbps(S, K, H, c_f):5.0f} GB/s) | '

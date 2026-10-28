@@ -15,7 +15,7 @@
 // Parallelism: tokens partitioned across AIVs. Full hidden row processed in one pass
 // (no H-chunk); UB holds ping/pong bf16 rows + fp32 tmp/acc.
 //
-// Sync: prologue → aclshmemx_barrier_all_vec → combine
+// Sync: prologue → cross-rank barrier (shmem_barrier.h) → combine
 // Hot paths use MTE2↔V HardEvents + mte_get_nbi ping-pong (grad_reduce style).
 // Weight (EVENT_ID2/3): same topK walk as dispatch ScatterPhase — primary issues
 // hidden+weight together; dup (load_mask=0) issues weight-only in the same pass
@@ -27,7 +27,9 @@
 
 #include "acl/acl.h"
 #include "kernel_operator.h"
-#include "shmem.h"
+// Must come before any other shmem include: shmem_barrier.h adapts shmem's
+// intra-device core sync for A2/A3 (see its header comment).
+#include "ascend_moonep/kernels/shmem_barrier.h"
 
 #include "ascend_moonep/kernels/launch.h"
 #include "ascend_moonep/kernels/types.h"
@@ -179,7 +181,7 @@ public:
             ProcessPrologue();
         }
         PipeBarrier<PIPE_ALL>();
-        aclshmemx_barrier_all_vec();
+        MOONEP_SHMEM_BARRIER_ALL();
 
         if (n_tokens_ > 0) {
             ProcessCombine();
@@ -370,9 +372,9 @@ private:
         LocalTensor<int32_t> loffStage = UB<int32_t>(offLoff_);
 
         // Dual store-stage credits (dispatch PlanEpiloguePhase style).
-        // Prologue owns ID2/ID3 for MTE3_MTE2; drained before the barrier.
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
+        // Prologue owns ID2/ID3 for MTE3_V; drained before the barrier.
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID2);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID3);
         prologue_store_stage_ = 0;
 
         int32_t aiv_loff_start = 0;
@@ -435,8 +437,8 @@ private:
             g0 += g_count;
         }
 
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID2);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID3);
     }
 
     __aicore__ inline int32_t DupLoffAt(
@@ -451,7 +453,7 @@ private:
         LocalTensor<int32_t> ubLoff = UB<int32_t>(offMeta_);
         int32_t loff_base = (d_idx / kAlignInt32) * kAlignInt32;
         DataCopy(ubLoff, gmDupLoffs_[loff_base], kAlignInt32);
-        // ID0: keep ID2/ID3 free for prologue store MTE3_MTE2 credits.
+        // ID0: keep ID2/ID3 free for prologue store MTE3_V credits.
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         return ubLoff.GetValue(d_idx - loff_base);
@@ -540,23 +542,23 @@ private:
         LocalTensor<T> store_row = prologue_store_stage_ == 0
             ? UB<T>(offStore0_)
             : UB<T>(offStore1_);
-        WaitFlag<HardEvent::MTE3_MTE2>(store_ev);
+        WaitFlag<HardEvent::MTE3_V>(store_ev);
         Cast(store_row, acc, RoundMode::CAST_RINT, H_);
         SetFlag<HardEvent::V_MTE3>(store_ev);
         WaitFlag<HardEvent::V_MTE3>(store_ev);
         DataCopy(gmHiddenLocal_[prim_off], store_row, h_copy_n_);
-        SetFlag<HardEvent::MTE3_MTE2>(store_ev);
+        SetFlag<HardEvent::MTE3_V>(store_ev);
         prologue_store_stage_ ^= 1;
     }
 
     // ── Combine: topK walk + cross-token out-store pipeline ──
     __aicore__ inline void ProcessCombine()
     {
-        // Out-store credits on ID0/ID1 (MTE3_MTE2); physical store* rows.
+        // Out-store credits on ID0/ID1 (MTE3_V); physical store* rows.
         // No fake sk credit on ID2 — weight get also uses ID2 (MTE2_S); only
-        // Wait MTE3_MTE2(ID2) after a real sk DataCopy SetFlag.
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+        // Wait MTE3_S(ID2) after a real sk DataCopy SetFlag.
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
         combine_store_stage_ = 0;
         sk_mte3_pending_ = 0;
 
@@ -564,10 +566,10 @@ private:
             ProcessOneToken(s);
         }
 
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
         if (has_weight_ptr_ && sk_mte3_pending_) {
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
             sk_mte3_pending_ = 0;
         }
     }
@@ -608,7 +610,7 @@ private:
         // First token: sk_mte3_pending_==0 → no Wait (avoids bogus ID2 credit
         // colliding with weight MTE2_S on ID2).
         if (has_weight_ptr_ && sk_mte3_pending_) {
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
             sk_mte3_pending_ = 0;
         }
 
@@ -621,13 +623,14 @@ private:
         LocalTensor<T> store_row = combine_store_stage_ == 0
             ? UB<T>(offStore0_)
             : UB<T>(offStore1_);
-        // Wait only this stage's prior MTE3 (credit or previous out-store).
-        WaitFlag<HardEvent::MTE3_MTE2>(store_ev);
+        // The next writer is Vector (Cast), so wait on MTE3_V. MTE3_MTE2
+        // only stalls loads and does not protect this store row from Cast.
+        WaitFlag<HardEvent::MTE3_V>(store_ev);
         Cast(store_row, acc, RoundMode::CAST_RINT, H_);
         SetFlag<HardEvent::V_MTE3>(store_ev);
         WaitFlag<HardEvent::V_MTE3>(store_ev);
         DataCopy(gmOut_[out_row], store_row, h_copy_n_);
-        SetFlag<HardEvent::MTE3_MTE2>(store_ev);
+        SetFlag<HardEvent::MTE3_V>(store_ev);
         combine_store_stage_ ^= 1;
 
         if (has_weight_ptr_) {
@@ -638,7 +641,7 @@ private:
                 gmOutSk_[static_cast<int64_t>(s) * sk_stride_],
                 ubSk,
                 dst_copy_n_);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID2);
             sk_mte3_pending_ = 1;
         }
     }

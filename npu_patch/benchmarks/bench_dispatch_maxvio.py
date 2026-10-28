@@ -190,9 +190,9 @@ def time_op(fn, group, rank, warmup=20, iters=50, stats=None,
 
     dev = torch.device(f"npu:{torch.npu.current_device()}")
     world_size = dist.get_world_size(group=group)
-    local = torch.tensor([local_us], dtype=torch.float64, device=dev)
+    local = torch.tensor([local_us], dtype=torch.float32, device=dev)
     gathered = [
-        torch.empty(1, dtype=torch.float64, device=dev)
+        torch.empty(1, dtype=torch.float32, device=dev)
         for _ in range(world_size)
     ]
     dist.all_gather(gathered, local, group=group)
@@ -246,8 +246,12 @@ class DispatchRunner:
     """Own the Buffer, plan, and fixed dispatch inputs for one benchmark."""
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, with_weights,
-                 rank=None, use_udma=False, dedup_mode="rank"):
+                 rank=None, use_udma=False, dedup_mode="rank",
+                 plan_source="kernel"):
         self.group = group
+        # 'kernel': device planner (Ascend950/SIMT only); 'golden': host plan via
+        # test_npu/planing_reference -- the only way to run on A2/A3.
+        self.plan_source = plan_source
         self.rank = rank if rank is not None else dist.get_rank(group=group)
         self.R = R
         self.S = S
@@ -290,13 +294,18 @@ class DispatchRunner:
     def prepare(self, topk, tokens_per_expert):
         """Run real planning once; no planning work is in ``dispatch``."""
         topk_flat = topk.reshape(-1).contiguous()
-        launch_planning(
-            self.ctx,
-            topk_flat,
-            tokens_per_expert,
-            self.cu_seqlens,
-            self.plan,
-        )
+        if self.plan_source == "golden":
+            from test_npu.planing_reference import reference_plan_and_cu_seqlens
+            self.plan, self.cu_seqlens = reference_plan_and_cu_seqlens(
+                self.ctx, topk_flat, tokens_per_expert)
+        else:
+            launch_planning(
+                self.ctx,
+                topk_flat,
+                tokens_per_expert,
+                self.cu_seqlens,
+                self.plan,
+            )
         torch.npu.synchronize()
         ShmemRuntime.barrier(group=self.group)
 
@@ -430,6 +439,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_engine_args(parser)
     parser.add_argument(
+        "--plan-source",
+        choices=("kernel", "golden"),
+        default="kernel",
+        help="kernel: device planner (Ascend950/SIMT only); golden: build the "
+             "plan on the host with test_npu/planing_reference (required on "
+             "A2/A3, where the SIMT planner is not built).",
+    )
+    parser.add_argument(
         "--out",
         default="bench_dispatch_maxvio_results.csv",
         help="CSV output path on rank 0 (default: %(default)s)",
@@ -511,6 +528,7 @@ def main():
         rank=rank if args.no_dist else None,
         use_udma=use_udma,
         dedup_mode=args.dedup_mode,
+        plan_source=args.plan_source,
     )
     if not ShmemRuntime.is_initialized():
         if args.no_dist:
