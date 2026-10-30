@@ -6,3 +6,4 @@ __pycache__/
 *.nsys-rep
 build/**
 build_*/
+archive/
