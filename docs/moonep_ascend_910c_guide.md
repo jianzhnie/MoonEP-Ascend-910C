@@ -109,6 +109,8 @@ combine 的输出缓冲复用尤其需要区分流水线依赖。MTE3 写回尚�
 
 完整依赖及构建步骤见 [910C README](../README_910C.md#构建)。当前 `build_base.sh` 和 `build_a5.sh` 只接受 Ascend950；910C 使用显式 CMake a2 构建。shmem、内核库与 `_C` 扩展应使用匹配的工具链，torch / torch_npu 变化后需检查 ABI 并重编译扩展。
 
+外部框架可通过 [wheel 安装](../README_910C.md#安装为-python-包) 导入 `moonep.Buffer`、`moonep.MoonEPCommPlan` 和 `npu_patch.planning_host.build_plan_host`，无需依赖源码路径。Ascend 打包从 `npu_patch/` 执行；wheel 随包分发通信内核和 shmem 动态库，PyTorch / torch_npu、CANN 及驱动由目标环境提供。
+
 普通堆的调用顺序如下，各步骤使用同一 EP 进程组：
 
 1. 设置本地 NPU，初始化 HCCL 进程组。

@@ -57,6 +57,42 @@ python -c 'import torch, torch_npu; from npu_patch import _C; print(torch.__vers
 
 `build_a5.sh` 和当前 `build_base.sh` 只接受 Ascend950；910C 请使用上述显式 CMake 步骤。内核、shmem 和 Python 扩展应来自同一套工具链及依赖版本。
 
+## 安装为 Python 包
+
+完成上述 shmem 和 a2 内核构建后，可将 Python 接口、`npu_patch._C` 和 `npu_patch/lib/` 下的运行库打包为 wheel。在仓库根目录执行：
+
+```bash
+mkdir -p dist
+(cd npu_patch && MOONEP_BUILD_BACKEND=npu \
+  python -m pip wheel . --no-build-isolation --no-deps --wheel-dir ../dist)
+python -m pip install --force-reinstall --no-deps dist/moonep-*.whl
+```
+
+Ascend 打包入口是 `npu_patch/`；仓库根目录的 `setup.py` 构建 CUDA 扩展。开发时可使用上一节的 editable 安装；wheel 安装后不需要保留源码目录，也不需要在业务代码中修改 `sys.path` 或设置指向源码的 `PYTHONPATH`。
+
+wheel 不包含 PyTorch、torch_npu、CANN 和驱动。目标环境应使用匹配的 Python、CPU 架构和运行时版本；更换 torch / torch_npu 后需重新构建。当前打包验证环境为 aarch64、Python 3.12、torch / torch_npu 2.12.0、CANN 9.1.0。安装时使用 `--no-deps` 保留已配好的 NPU 环境。
+
+该环境已生成 `moonep-0.0.1-cp312-cp312-linux_aarch64.whl`，完成独立目录安装、仓库外导入及随包动态库加载检查；普通安装后，从仓库外运行主机规划器契约测试，6 项通过。此验证不包含 NPU 通信或 benchmark 复测。
+
+在任意外部代码目录中，先加载 CANN 环境，再导入：
+
+```bash
+source /usr/local/Ascend/cann-9.1.0/set_env.sh
+export MOONEP_BACKEND=npu
+export ASCEND_MOONEP_HEAP=shmem
+python -c 'import moonep; from npu_patch import _C; print(moonep.__file__, _C.__file__)'
+```
+
+本次外部导入验证发现，容器的 `LD_LIBRARY_PATH` 末尾存在空项，可能从当前目录加载同名旧内核库。运行前应移除空项和旧 MoonEP 库路径；例如尾部空项可用 `export LD_LIBRARY_PATH="${LD_LIBRARY_PATH%:}"` 移除，避免覆盖 wheel 内的运行库。
+
+```python
+from moonep import Buffer, MoonEPCommPlan, init_shmem
+from npu_patch import ShmemRuntime
+from npu_patch.planning_host import build_plan_host
+```
+
+导入成功只验证包与动态库加载。执行通信仍需设置本地 NPU、初始化 HCCL / shmem，并为 910C 显式提供主机 plan。`build_plan_host` 生成规划字段，调用方仍需汇总专家计数、组装 `MoonEPCommPlan` 和去重元数据；安装包不会自动启用 910C 设备规划器，也不依赖仓库中的测试模块。
+
 ## 运行与自检
 
 ```bash
