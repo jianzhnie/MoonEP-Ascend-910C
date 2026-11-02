@@ -121,8 +121,14 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
     buffer._ensure_shmem_views()
 
     # Shared routing (seed 1234 -> rank-shared expert popularity, rank -> per-token draws).
-    topk, tpe = generate_topk_routing(S, K, E, R, bias_ratio, dev, 1234,
-                                      rank=group_rank)
+    if args.routing == "random-topk":
+        generator = torch.Generator(device=dev).manual_seed(23000 + group_rank)
+        scores = torch.randn((S, E), device=dev, generator=generator)
+        topk = torch.topk(scores, K, dim=-1, sorted=False).indices.int()
+        tpe = torch.bincount(topk.flatten().long(), minlength=E).int()
+    else:
+        topk, tpe = generate_topk_routing(S, K, E, R, bias_ratio, dev, 1234,
+                                          rank=group_rank)
     hidden_sh = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
     route_weights_sk = torch.rand(S, K, dtype=torch.float32, device=dev)
     grad_output = torch.randn(S, H, dtype=torch.bfloat16, device=dev)
@@ -254,6 +260,10 @@ def parse_args():
                     help="Restrict sweep to this lognormal sigma.")
     ap.add_argument("--experts", type=int, default=None,
                     help="Override total expert count E.")
+    ap.add_argument("--tokens", type=int, default=None,
+                    help="Tokens per rank; with --hidden and --topk selects one custom shape.")
+    ap.add_argument("--routing", choices=("lognormal", "random-topk"), default="lognormal",
+                    help="random-topk matches MegaMoE's iid normal scores and top-k selection.")
     ap.add_argument("--flows", type=str, default=",".join(FLOWS),
                     help="Comma-separated flows to run: " + ",".join(FLOWS))
     ap.add_argument(
@@ -290,6 +300,16 @@ def main():
                 f"--prod requires --ep-size dividing E={PROD_E}; got ep={ep}")
         configs = [dict(ep=ep, H=PROD_H, K=PROD_K, S=PROD_S, E=PROD_E,
                         unbalance_ratio=1.0)]
+    elif args.tokens is not None:
+        if (args.tokens <= 0 or args.hidden is None or args.hidden <= 0
+                or args.topk is None or args.topk <= 0
+                or args.experts is None or args.experts <= 0):
+            raise SystemExit("--tokens requires positive --tokens, --hidden, --topk and --experts")
+        if args.experts % ep or not 0 < args.topk <= args.experts:
+            raise SystemExit("experts must be divisible by EP and 0 < topk <= experts")
+        configs = [dict(ep=ep, H=args.hidden, K=args.topk, S=args.tokens,
+                        E=args.experts, unbalance_ratio=args.unbalance_ratio
+                        if args.unbalance_ratio is not None else 1.0)]
     else:
         configs = build_configs(ep, args.experts)
         configs = [c for c in configs if (
@@ -315,7 +335,7 @@ def main():
         "planning_us", "dispatch_fwd_us", "dispatch_bwd_us",
         "combine_fwd_us", "combine_bwd_us",
         "dispatch_fwd_GBps", "dispatch_bwd_GBps",
-        "combine_fwd_GBps", "combine_bwd_GBps",
+        "combine_fwd_GBps", "combine_bwd_GBps", "routing",
     ]
     if rank == 0 and args.out:
         out_dir = os.path.dirname(args.out)
@@ -394,7 +414,7 @@ def main():
                     _cv_us("dispatch_bwd"), _cv_us("combine_fwd"),
                     _cv_us("combine_bwd"),
                     _cv_gb("dispatch_fwd"), _cv_gb("dispatch_bwd"),
-                    _cv_gb("combine_fwd"), _cv_gb("combine_bwd"),
+                    _cv_gb("combine_fwd"), _cv_gb("combine_bwd"), args.routing,
                 ])
                 csv_file.flush()
 

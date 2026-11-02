@@ -7,3 +7,4 @@ __pycache__/
 build/**
 build_*/
 archive/
+benchmark_results/

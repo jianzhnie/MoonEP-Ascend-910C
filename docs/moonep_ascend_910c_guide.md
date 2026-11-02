@@ -142,6 +142,8 @@ torchrun --standalone --nproc_per_node=2 \
 
 ## 4. Benchmark：结果与口径
 
+MegaMoE 同形状配置的补充测试见 [EP8、top-k=6 通信 benchmark](moonep_megamoe_benchmark.md)：覆盖 96 / 384 experts、H=5120 / 7168 和每 rank 64 / 256 / 4096 / 16384 tokens 的八组组合，全部通过数值往返检查。文档分别报告 BF16 dispatch / combine、包含两次 grouped GEMM 与一个 shared expert 的完整前向实测，以及理论等效指标。完整前向最高 181.22 TFLOPS/rank；利用率按 376 TFLOPS/逻辑设备的假设峰值归一化，不能与 950DT 上的 FP8 融合实现直接计算加速比。
+
 ### 4.1 环境与计时方法
 
 测试采用单机 8 × Ascend910_9392，环境为 CANN 9.1.0、Python 3.12、torch / torch_npu 2.12.0，未覆盖跨机器 EP。测试期间存在并发训练任务，下表用于记录执行表现，不作为稳定加速比或版本回退的依据。
